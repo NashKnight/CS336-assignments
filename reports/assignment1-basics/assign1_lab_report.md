@@ -106,3 +106,91 @@ TinyStories tokenizer 学到的 token 更偏儿童故事语料中的常见英文
 ### (d)
 
 我已经把训练集和验证集都编码成 `uint16` 的 NumPy array：TinyStories train 有 `540,796,778` 个 token，TinyStories valid 有 `5,461,210` 个 token；OpenWebText train 有 `2,727,120,452` 个 token，OpenWebText valid 有 `66,401,098` 个 token。`uint16` 合适是因为这里最大的词表大小是 32,000，所有 token id 都小于 `2^16 = 65,536`，因此 `uint16` 足够表示全部 token id，同时比 `int32` 或 `int64` 更省磁盘和内存。
+
+## Problem: linear
+
+实现无 bias 的 `Linear`（权重形状 `(d_out, d_in)`，截断正态初始化）。`test_linear` 通过。
+
+## Problem: embedding
+
+实现 `Embedding` 查表。`test_embedding` 通过。
+
+## Problem: rmsnorm
+
+实现 pre-norm 用的 `RMSNorm`（先升到 fp32 再算）。`test_rmsnorm` 通过。
+
+## Problem: positionwise_feedforward
+
+实现 `SwiGLU`：`w2(silu(w1(x)) * w3(x))`。`test_swiglu`、`test_silu_matches_pytorch` 通过。
+
+## Problem: rope
+
+实现 `RoPE`（奇偶维旋转，cos/sin buffer 预计算）。`test_rope` 通过。
+
+## Problem: softmax
+
+实现数值稳定的 `softmax`（减 max）。`test_softmax_matches_pytorch` 通过。
+
+## Problem: scaled_dot_product_attention
+
+实现 SDPA；课程约定 `mask=True` 保留、`False` 屏蔽。`test_scaled_dot_product_attention`、`test_4d_scaled_dot_product_attention` 通过。
+
+## Problem: multihead_self_attention
+
+实现因果 MHA（分头 QKV、可选 RoPE、`tril` causal mask、`output_proj`）。`test_multihead_self_attention`、`test_multihead_self_attention_with_rope` 通过。
+
+## Problem: transformer_block
+
+实现 pre-norm block：`x + attn(ln1(x))`，再 `x + ffn(ln2(x))`。`test_transformer_block` 通过。
+
+## Problem: transformer_lm
+
+实现完整 LM：`token_embeddings → N×TransformerBlock → ln_final → lm_head`。`test_transformer_lm`、`test_transformer_lm_truncated_input` 通过。
+
+## Problem: transformer_accounting
+
+约定：作业架构（无 bias、SwiGLU、RoPE 无绝对位置表、embedding 与 `lm_head` 不共享）；矩阵乘 FLOPs 用 \(2mnp\)；embedding 查表不计 matmul。小/中/大模型的 \(d_{ff}\) 取最接近 \(\frac{8}{3}d_{model}\) 的 64 倍数（2048 / 2752 / 3392），\(V=50257\)，\(T=1024\)（除非另行说明）。
+
+参数量：
+\[
+2VD + L(4D^{2} + 3D\,d_{ff} + 2D) + D.
+\]
+
+前向 matmul（序列长 \(T\)）：每层 Q/K/V/O 投影 \(8TD^{2}\)，\(QK^{\top}\) 与 Attn\(V\) 各 \(2T^{2}D\)，SwiGLU \(6TD\,d_{ff}\)；最后 `lm_head` \(2TDV\)。
+
+### (a)
+
+GPT-2 XL（\(V{=}50257,\,T{=}1024,\,L{=}48,\,D{=}1600,\,d_{ff}{=}4288\)）：**1,640,452,800** 参数；fp32 加载约 **6.56 GB**（\(\times 4\) bytes）。
+
+### (b)
+
+| matmul | FLOPs（\(T{=}1024\)） |
+|--------|----------------------|
+| 每层 Q/K/V 投影 | \(3\cdot 2TD^{2}=1.573\times 10^{10}\)（\(\times 48\)） |
+| 每层 O 投影 | \(2TD^{2}=5.243\times 10^{9}\)（\(\times 48\)） |
+| 每层 \(QK^{\top}\) | \(2T^{2}D=3.355\times 10^{9}\)（\(\times 48\)） |
+| 每层 Attn\(V\) | \(2T^{2}D=3.355\times 10^{9}\)（\(\times 48\)） |
+| 每层 SwiGLU \(w_{1,2,3}\) | \(6TD\,d_{ff}=4.215\times 10^{10}\)（\(\times 48\)） |
+| `lm_head` | \(2TDV=1.647\times 10^{11}\) |
+| **合计** | **\(3.517\times 10^{12}\) FLOPs** |
+
+### (c)
+
+FLOPs 主要在 **SwiGLU（约 57.5%）**，其次 attention 投影（约 28.6%）；SDPA 的 \(T^{2}\) 项与 `lm_head` 更小。
+
+### (d)
+
+\(T{=}1024\) 时各部件占比（占前向 matmul 总量）：
+
+| 模型 | 总 FLOPs | attn 投影 | SDPA \(T^{2}\) | FFN | lm_head |
+|------|----------|-----------|----------------|-----|---------|
+| small（12L, 768d, 12H） | \(2.92\times 10^{11}\) | 19.9% | 13.3% | 39.8% | 27.1% |
+| medium（24L, 1024d, 16H） | \(8.30\times 10^{11}\) | 24.8% | 12.4% | 50.1% | 12.7% |
+| large（36L, 1280d, 20H） | \(1.77\times 10^{12}\) | 27.3% | 10.9% | 54.3% | 7.5% |
+| XL | \(3.52\times 10^{12}\) | 28.6% | 9.2% | 57.5% | 4.7% |
+
+模型变大时：**FFN / attn 投影占比上升**，**`lm_head`（\(\propto VD\)）占比下降**；\(T\) 固定时 SDPA 占比略降。
+
+### (e)
+
+XL 将 \(T\) 提到 16,384：总 FLOPs 约 **\(1.336\times 10^{14}\)**（约为 \(T{=}1024\) 时的 **38×**）。SDPA 的 \(T^{2}\) 项升至约 **62%**，投影与 FFN（\(\propto T\)）占比下降；长上下文下 attention score/value 乘法成为主导。
